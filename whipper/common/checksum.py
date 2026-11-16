@@ -33,13 +33,42 @@ logger = logging.getLogger(__name__)
 # checksums are not CRC's. a CRC is a specific type of checksum.
 
 
+class RunningChecksum:
+    """
+    Mutable holder for a cumulative CRC32 value.
+
+    Pass the same instance as ``running`` to several CRC32Tasks that run
+    in order; each task continues the CRC from the holder's current value,
+    so the final value equals the CRC32 of all the data combined.
+    """
+
+    def __init__(self, value=0):
+        self.value = value
+
+
 class CRC32Task(etask.Task):
-    # TODO: Support sampleStart, sampleLength later on (should be trivial, just
-    # add change the read part in _crc32 to skip some samples and/or not
-    # read too far)
-    def __init__(self, path, sampleStart=0, sampleLength=-1, is_wave=True):
+    # how many bytes to read at once when computing the checksum
+    _BLOCK_SIZE = 1024 * 1024
+
+    def __init__(self, path, sampleStart=0, sampleLength=-1, is_wave=True,
+                 chain=None):
+        """
+        Init CRC32Task.
+
+        :param path: path of the file to checksum
+        :param sampleStart: first sample frame (wave frame) to include
+        :param sampleLength: number of sample frames to include,
+                             -1 for all remaining
+        :param is_wave: whether the file is a WAV; if False it is decoded
+                        with flac first
+        :param chain: optional RunningChecksum to chain this checksum into
+        """
         self.path = path
         self.is_wave = is_wave
+        self.sampleStart = sampleStart
+        self.sampleLength = sampleLength
+        self.chain = chain
+        self.checksum = None
 
     def start(self, runner):
         etask.Task.start(self, runner)
@@ -58,7 +87,24 @@ class CRC32Task(etask.Task):
         else:
             w = wave.open(self.path)
 
-        d = w._data_chunk.read()
+        crc = self.chain.value if self.chain is not None else 0
+        bytes_per_frame = w.getsampwidth() * w.getnchannels()
+        block_frames = max(1, self._BLOCK_SIZE // bytes_per_frame)
+        w.setpos(self.sampleStart)
+        remaining = self.sampleLength
+        while remaining != 0:
+            if remaining < 0:
+                nframes = block_frames
+            else:
+                nframes = min(remaining, block_frames)
+            d = w.readframes(nframes)
+            if not d:
+                break
+            crc = binascii.crc32(d, crc)
+            if remaining > 0:
+                remaining -= nframes
 
-        self.checksum = binascii.crc32(d) & 0xffffffff
+        self.checksum = crc & 0xffffffff
+        if self.chain is not None:
+            self.chain.value = crc
         self.stop()
