@@ -406,9 +406,14 @@ Log files will log the path to tracks relative to this directory.
         if os.path.exists(dirname):
             log_file = discName + '.log'
             if os.path.exists(log_file):
-                msg = ("output directory %s is a finished rip" % dirname)
-                logger.debug(msg)
-                raise RuntimeError(msg)
+                if self.options.skip_existing:
+                    logger.warning("output directory %s is a finished rip, "
+                                   "continuing due to --skip-existing",
+                                   dirname)
+                else:
+                    msg = ("output directory %s is a finished rip" % dirname)
+                    logger.debug(msg)
+                    raise RuntimeError(msg)
         else:
             logger.info("creating output directory %s", dirname)
             os.makedirs(dirname)

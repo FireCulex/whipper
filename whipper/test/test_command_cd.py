@@ -97,3 +97,20 @@ class SkipExistingTestCase(common.TestCase):
         self.assertTrue(rip.program.ripTrack.called)
         _, kwargs = rip.program.ripTrack.call_args
         self.assertEqual(kwargs['verifyChunkSize'], 150)
+
+    def testFinishedRipDirRejectedByDefault(self):
+        # a .log next to the disc file marks the rip as finished
+        with open(os.path.join(self.dir, 'disc.log'), 'w') as f:
+            f.write('log')
+        rip = _make_rip(self.dir, skip_existing=False)
+        self.assertRaises(RuntimeError, rip.doCommand)
+
+    def testSkipExistingAllowsFinishedRipDir(self):
+        with open(os.path.join(self.dir, 'disc.log'), 'w') as f:
+            f.write('log')
+        rip = _make_rip(self.dir, skip_existing=True)
+
+        rip.doCommand()
+
+        self.assertFalse(rip.program.verifyTrack.called)
+        self.assertTrue(os.path.exists(self.track_path))
