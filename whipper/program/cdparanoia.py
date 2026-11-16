@@ -18,6 +18,7 @@
 # You should have received a copy of the GNU General Public License
 # along with whipper.  If not, see <http://www.gnu.org/licenses/>.
 
+import binascii
 import errno
 import os
 import re
@@ -428,10 +429,13 @@ class VerifyChunkTask(task.Task):
     Compare the test and verify checksums of one chunk of frames.
 
     If they match, the chunk's audio data is appended to the output WAV
-    (including the WAV header for the first chunk, with its size fields
-    fixed up to cover the whole track) and the chunk's temporary files
-    are removed. If they don't match, a ChecksumException naming the
-    frame range is raised.
+    (including the WAV header for the first appended chunk, with its size
+    fields fixed up to cover the whole track), the chunk's cumulative CRC
+    is updated, and the chunk's temporary files are removed.
+
+    If they don't match and attempts remain, the parent task is asked to
+    re-read just this chunk (``_insertRetry``); only when all attempts are
+    exhausted is a ChecksumException naming the frame range raised.
     """
 
     logCategory = 'VerifyChunkTask'
@@ -442,11 +446,12 @@ class VerifyChunkTask(task.Task):
     _WAV_HEADER_SIZE = 44
     _BLOCK_SIZE = 1024 * 1024
 
-    def __init__(self, testCrc, verifyCrc, testPath, verifyPath, outPath,
-                 start, stop, first, totalDataBytes=None):
+    def __init__(self, parent, testCrc, verifyCrc, testPath, verifyPath,
+                 outPath, start, stop, totalDataBytes=None, maxAttempts=5):
         """
         Init VerifyChunkTask.
 
+        :param parent: the ReadVerifyTrackTask running this chunk
         :param testCrc: CRC32Task that checksummed the test read of the chunk
         :param verifyCrc: CRC32Task that checksummed the verify read
         :param testPath: path of the WAV holding the test read
@@ -454,10 +459,12 @@ class VerifyChunkTask(task.Task):
         :param outPath: path of the output WAV to append the chunk to
         :param start: first frame of the chunk (inclusive)
         :param stop: last frame of the chunk (inclusive)
-        :param first: whether this is the first chunk of the track
         :param totalDataBytes: audio bytes of the whole track, used to fix
-                               up the WAV header of the first chunk
+                               up the WAV header of the first appended chunk
+        :param maxAttempts: how many times the chunk may be re-read when
+                            test and verify checksums disagree
         """
+        self._parent = parent
         self._testCrc = testCrc
         self._verifyCrc = verifyCrc
         self._testPath = testPath
@@ -465,28 +472,51 @@ class VerifyChunkTask(task.Task):
         self._outPath = outPath
         self._start = start
         self._stop = stop
-        self._first = first
         self._totalDataBytes = totalDataBytes
+        self._maxAttempts = maxAttempts
         self.description = 'Verifying frames %d-%d' % (start, stop)
 
     def start(self, runner):
         task.Task.start(self, runner)
         self.schedule(0.0, self._verify)
 
+    def _cleanup(self):
+        for p in (self._testPath, self._verifyPath):
+            if os.path.exists(p):
+                os.unlink(p)
+
     def _verify(self):
         if self._testCrc.checksum != self._verifyCrc.checksum:
+            self._cleanup()
+            # attempts are tracked per chunk on the parent, so they survive
+            # across the fresh tasks created for each retry
+            key = (self._start, self._stop)
+            attempts = self._parent._chunkAttempts.get(key, 0) + 1
+            self._parent._chunkAttempts[key] = attempts
+            if attempts < self._maxAttempts:
+                logger.warning('read/verify mismatch for frames %d-%d '
+                               '(attempt %d of %d), re-reading chunk only',
+                               self._start, self._stop, attempts,
+                               self._maxAttempts)
+                self._parent._insertRetry(self._start, self._stop)
+                self.stop()
+                return
             self.setAndRaiseException(ChecksumException(
-                'read and verify failed for frames %d-%d: test checksum '
-                '%08x, verify checksum %08x' % (
-                    self._start, self._stop,
+                'read and verify failed for frames %d-%d after %d '
+                'attempts: test checksum %08x, verify checksum %08x' % (
+                    self._start, self._stop, attempts,
                     self._testCrc.checksum, self._verifyCrc.checksum)))
             self.stop()
             return
 
+        # checksums match: append the audio data to the output WAV and
+        # fold it into the track's cumulative test checksum
+        first = self._parent._appended == 0
+        crc = self._parent._runningTest.value
         with open(self._testPath, 'rb') as src, \
                 open(self._outPath, 'ab') as dst:
             header = bytearray(src.read(self._WAV_HEADER_SIZE))
-            if self._first:
+            if first:
                 if self._totalDataBytes is not None:
                     # the chunk header only covers the chunk; fix up the
                     # RIFF and data size fields to cover the whole track
@@ -499,9 +529,13 @@ class VerifyChunkTask(task.Task):
                 if not block:
                     break
                 dst.write(block)
+                crc = binascii.crc32(block, crc)
 
-        os.unlink(self._testPath)
-        os.unlink(self._verifyPath)
+        self._parent._runningTest.value = crc
+        # every chunk matched, so the chained verify checksum is identical
+        self._parent._runningVerify.value = crc
+        self._parent._appended += 1
+        self._cleanup()
         self.stop()
 
 
@@ -541,7 +575,7 @@ class ReadVerifyTrackTask(task.MultiSeparateTask):
 
     def __init__(self, path, table, start, stop, overread, offset=0,
                  device=None, taglist=None, what="track", coverArtPath=None,
-                 verifyChunkSize=0):
+                 verifyChunkSize=0, maxChunkAttempts=5):
         """
         Init ReadVerifyTrackTask.
 
@@ -565,6 +599,10 @@ class ReadVerifyTrackTask(task.MultiSeparateTask):
                                 so a mismatch is reported with its frame
                                 range; 0 verifies the whole track at once
         :type verifyChunkSize: int
+        :param maxChunkAttempts: how many times a single chunk is re-read
+                                 when its test and verify checksums disagree
+                                 before the track rip fails
+        :type maxChunkAttempts: int
         """
         task.MultiSeparateTask.__init__(self)
 
@@ -586,38 +624,23 @@ class ReadVerifyTrackTask(task.MultiSeparateTask):
         self._chunkPaths = []
         self._readTasks = []
         self._verifyTasks = []
-        # the per-chunk CRCs of each pass are chained, so they combine into
-        # the same value a whole-track CRC would give
+        # cumulative checksums of the two passes; updated by each
+        # successfully verified chunk, so they combine into the same
+        # value a whole-track CRC would give
         self._runningTest = checksum.RunningChecksum()
         self._runningVerify = checksum.RunningChecksum()
-
-        chunks = chunkRanges(start, stop, verifyChunkSize)
-        for i, (cs, ce) in enumerate(chunks):
-            testpath = self._mktmp('.whipper.test.wav')
-            verifypath = self._mktmp('.whipper.verify.wav')
-            self._chunkPaths.append((testpath, verifypath))
-            if len(chunks) > 1:
-                chunkWhat = '%s (frames %d-%d)' % (what, cs, ce)
-            else:
-                chunkWhat = what
-            t_read = ReadTrackTask(testpath, table, cs, ce, overread,
-                                   offset=offset, device=device,
-                                   what=chunkWhat)
-            t_crcTest = checksum.CRC32Task(testpath, chain=self._runningTest)
-            t_verify = ReadTrackTask(verifypath, table, cs, ce, overread,
-                                     offset=offset, device=device,
-                                     action="Verifying", what=chunkWhat)
-            t_crcVerify = checksum.CRC32Task(verifypath,
-                                             chain=self._runningVerify)
-            t_append = VerifyChunkTask(t_crcTest, t_crcVerify, testpath,
-                                       verifypath, tmppath, cs, ce,
-                                       first=(i == 0),
-                                       totalDataBytes=(
-                                           (stop - start + 1) *
-                                           common.BYTES_PER_FRAME))
-            self._readTasks.append(t_read)
-            self._verifyTasks.append(t_verify)
-            self.tasks += [t_read, t_crcTest, t_verify, t_crcVerify, t_append]
+        self._appended = 0
+        self._chunkAttempts = {}
+        self._table = table
+        self._overread = overread
+        self._offset = offset
+        self._device = device
+        self._what = what
+        self._totalDataBytes = (stop - start + 1) * common.BYTES_PER_FRAME
+        self._maxChunkAttempts = maxChunkAttempts
+        self._chunks = chunkRanges(start, stop, verifyChunkSize)
+        for cs, ce in self._chunks:
+            self.tasks += self._buildChunkTasks(cs, ce)
 
         # encode to the final path + '.part'
         try:
@@ -657,6 +680,46 @@ class ReadVerifyTrackTask(task.MultiSeparateTask):
         os.fchmod(fd, 0o644)
         os.close(fd)
         return path
+
+    def _buildChunkTasks(self, cs, ce):
+        """
+        Build the task sequence for one chunk: test read, checksum,
+        verify read, checksum, compare+append. Used both for the initial
+        pass and for re-reading a chunk that failed verification.
+        """
+        from whipper.common import checksum
+
+        testpath = self._mktmp('.whipper.test.wav')
+        verifypath = self._mktmp('.whipper.verify.wav')
+        self._chunkPaths.append((testpath, verifypath))
+        if len(self._chunks) > 1:
+            chunkWhat = '%s (frames %d-%d)' % (self._what, cs, ce)
+        else:
+            chunkWhat = self._what
+        t_read = ReadTrackTask(testpath, self._table, cs, ce,
+                               self._overread, offset=self._offset,
+                               device=self._device, what=chunkWhat)
+        t_crcTest = checksum.CRC32Task(testpath)
+        t_verify = ReadTrackTask(verifypath, self._table, cs, ce,
+                                 self._overread, offset=self._offset,
+                                 device=self._device, action="Verifying",
+                                 what=chunkWhat)
+        t_crcVerify = checksum.CRC32Task(verifypath)
+        t_append = VerifyChunkTask(self, t_crcTest, t_crcVerify, testpath,
+                                   verifypath, self._tmpwavpath, cs, ce,
+                                   totalDataBytes=self._totalDataBytes,
+                                   maxAttempts=self._maxChunkAttempts)
+        self._readTasks.append(t_read)
+        self._verifyTasks.append(t_verify)
+        return [t_read, t_crcTest, t_verify, t_crcVerify, t_append]
+
+    def _insertRetry(self, cs, ce):
+        """
+        Insert a fresh set of tasks for a chunk whose verification failed,
+        so only that chunk is re-read instead of the whole track.
+        """
+        logger.debug('queueing re-read of chunk frames %d-%d', cs, ce)
+        self.tasks[self._task:self._task] = self._buildChunkTasks(cs, ce)
 
     def stop(self):
         # FIXME: maybe this kind of try-wrapping to make sure

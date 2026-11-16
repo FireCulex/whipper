@@ -124,6 +124,20 @@ def _write_wav(path, data):
     w.close()
 
 
+class _FakeParent:
+    """Minimal stand-in for ReadVerifyTrackTask as a VerifyChunkTask parent."""
+
+    def __init__(self):
+        self._appended = 0
+        self._chunkAttempts = {}
+        self._runningTest = checksum.RunningChecksum()
+        self._runningVerify = checksum.RunningChecksum()
+        self.retries = []
+
+    def _insertRetry(self, cs, ce):
+        self.retries.append((cs, ce))
+
+
 class VerifyChunkTaskTestCase(common.TestCase):
 
     def setUp(self):
@@ -145,10 +159,11 @@ class VerifyChunkTaskTestCase(common.TestCase):
         return SimpleNamespace(checksum=value)
 
     def testMatchingChecksumsAppendChunk(self):
+        parent = _FakeParent()
         t = cdparanoia.VerifyChunkTask(
-            self._crc(0xdeadbeef), self._crc(0xdeadbeef),
+            parent, self._crc(0xdeadbeef), self._crc(0xdeadbeef),
             self.testPath, self.verifyPath, self.outPath,
-            start=10, stop=19, first=True, totalDataBytes=len(self.data))
+            start=10, stop=19, totalDataBytes=len(self.data))
         self.runner.run(t)
 
         with open(self.outPath, 'rb') as f:
@@ -162,20 +177,44 @@ class VerifyChunkTaskTestCase(common.TestCase):
         # chunk temp files are cleaned up
         self.assertFalse(os.path.exists(self.testPath))
         self.assertFalse(os.path.exists(self.verifyPath))
+        # the chunk was counted as appended and folded into the running CRC
+        self.assertEqual(parent._appended, 1)
+        self.assertEqual(parent._runningTest.value & 0xffffffff,
+                         binascii.crc32(self.data) & 0xffffffff)
 
-    def testMismatchRaisesWithFrameRange(self):
+    def testMismatchRaisesWithFrameRangeWhenAttemptsExhausted(self):
+        parent = _FakeParent()
         t = cdparanoia.VerifyChunkTask(
-            self._crc(0x11111111), self._crc(0x22222222),
+            parent, self._crc(0x11111111), self._crc(0x22222222),
             self.testPath, self.verifyPath, self.outPath,
-            start=10, stop=19, first=True, totalDataBytes=len(self.data))
+            start=10, stop=19, totalDataBytes=len(self.data), maxAttempts=1)
         try:
             self.runner.run(t)
             self.fail('expected TaskException')
         except task.TaskException as e:
             self.assertIsInstance(e.exception, cdparanoia.ChecksumException)
             self.assertIn('frames 10-19', str(e.exception))
+        # no retry was queued with maxAttempts=1
+        self.assertEqual(parent.retries, [])
         # nothing was appended to the output
         self.assertEqual(os.path.getsize(self.outPath), 0)
+
+    def testMismatchQueuesRetryForSameChunkWithoutFailing(self):
+        parent = _FakeParent()
+        t = cdparanoia.VerifyChunkTask(
+            parent, self._crc(0x11111111), self._crc(0x22222222),
+            self.testPath, self.verifyPath, self.outPath,
+            start=10, stop=19, totalDataBytes=len(self.data), maxAttempts=3)
+        # with attempts remaining, the task queues a retry of its own chunk
+        # and completes without an exception
+        self.runner.run(t)
+        self.assertEqual(parent.retries, [(10, 19)])
+        self.assertEqual(parent._chunkAttempts, {(10, 19): 1})
+        self.assertEqual(parent._appended, 0)
+        # nothing was appended and the failed attempt's temps were cleaned
+        self.assertEqual(os.path.getsize(self.outPath), 0)
+        self.assertFalse(os.path.exists(self.testPath))
+        self.assertFalse(os.path.exists(self.verifyPath))
 
 
 class ReadVerifyTrackTaskStructureTestCase(common.TestCase):
@@ -199,7 +238,7 @@ class ReadVerifyTrackTaskStructureTestCase(common.TestCase):
         self.assertIsInstance(t.tasks[0], cdparanoia.ReadTrackTask)
         self.assertEqual((t.tasks[0]._start, t.tasks[0]._stop), (100, 199))
         self.assertIsInstance(t.tasks[4], cdparanoia.VerifyChunkTask)
-        self.assertTrue(t.tasks[4]._first)
+        self.assertIs(t.tasks[4]._parent, t)
 
     def testChunkedTasks(self):
         t = self._make(0, 24, 10)
@@ -214,10 +253,10 @@ class ReadVerifyTrackTaskStructureTestCase(common.TestCase):
             self.assertIsInstance(t.tasks[base + 4], cdparanoia.VerifyChunkTask)
             self.assertEqual(t.tasks[base]._start, i * 10)
             self.assertEqual(t.tasks[base]._stop, min(i * 10 + 9, 24))
-            self.assertEqual(t.tasks[base + 4]._first, i == 0)
-        # both passes of a chunk chain into the same running checksums
-        self.assertIs(t.tasks[1].chain, t.tasks[6].chain)
-        self.assertIs(t.tasks[3].chain, t.tasks[8].chain)
+            self.assertIs(t.tasks[base + 4]._parent, t)
+        # chunk checksums are compared per chunk, not chained up front
+        self.assertIsNone(t.tasks[1].chain)
+        self.assertIsNone(t.tasks[3].chain)
 
 
 class _NoopTask(task.Task):
@@ -242,9 +281,11 @@ def _chunk_data(start, stop, corrupt=False):
 
 class _FakeReadTrackTask(cdparanoia.ReadTrackTask):
     """ReadTrackTask that writes deterministic WAV data instead of
-    invoking cd-paranoia; the verify pass can be corrupted on demand."""
+    invoking cd-paranoia; the first N verify reads can be corrupted."""
 
     corrupt_verify = False
+    corrupt_verify_reads = 0  # corrupt this many verify reads, then behave
+    verify_reads = 0
 
     def __init__(self, *args, **kwargs):
         self._action = kwargs.get('action', 'Reading')
@@ -255,7 +296,12 @@ class _FakeReadTrackTask(cdparanoia.ReadTrackTask):
         self.schedule(0.0, self._fake_read)
 
     def _fake_read(self):
-        corrupt = self.corrupt_verify and self._action == 'Verifying'
+        corrupt = False
+        if self._action == 'Verifying':
+            type(self).verify_reads += 1
+            if (type(self).corrupt_verify and
+                    type(self).verify_reads <= type(self).corrupt_verify_reads):
+                corrupt = True
         _write_wav(self.path, _chunk_data(self._start, self._stop,
                                           corrupt=corrupt))
         frames = self._stop - self._start + 1
@@ -286,6 +332,8 @@ class ReadVerifyTrackTaskRunTestCase(common.TestCase):
         for p in self._patches:
             p.stop()
         _FakeReadTrackTask.corrupt_verify = False
+        _FakeReadTrackTask.corrupt_verify_reads = 0
+        _FakeReadTrackTask.verify_reads = 0
         shutil.rmtree(self.dir, ignore_errors=True)
 
     def _make(self, start, stop, verifyChunkSize):
@@ -311,6 +359,7 @@ class ReadVerifyTrackTaskRunTestCase(common.TestCase):
 
     def testChunkedRunDetectsCorruptVerifyPassWithRange(self):
         _FakeReadTrackTask.corrupt_verify = True
+        _FakeReadTrackTask.corrupt_verify_reads = 100  # always corrupt
         t = self._make(0, 24, 10)
         try:
             self.runner.run(t)
@@ -319,7 +368,26 @@ class ReadVerifyTrackTaskRunTestCase(common.TestCase):
             self.assertIsInstance(e.exception, cdparanoia.ChecksumException)
             # first chunk is frames 0-9
             self.assertIn('frames 0-9', str(e.exception))
+        # the failing chunk was retried up to maxChunkAttempts (default 5)
+        # before the track failed; later chunks were never read
+        self.assertEqual(_FakeReadTrackTask.verify_reads, 5)
         self.assertFalse(os.path.exists(self.out))
         for testpath, verifypath in t._chunkPaths:
             self.assertFalse(os.path.exists(testpath))
             self.assertFalse(os.path.exists(verifypath))
+
+    def testTransientMismatchRetriesOnlyThatChunk(self):
+        # corrupt just the first verify read (of chunk frames 0-9)
+        _FakeReadTrackTask.corrupt_verify = True
+        _FakeReadTrackTask.corrupt_verify_reads = 1
+        t = self._make(0, 24, 10)
+        self.runner.run(t)  # must not raise
+
+        expected = binascii.crc32(_chunk_data(0, 24)) & 0xffffffff
+        self.assertEqual(t.testchecksum, expected)
+        self.assertEqual(t.copychecksum, expected)
+        self.assertEqual(t.checksum, expected)
+        # 3 chunks x 1 verify read + 1 extra verify read for the retried
+        # chunk; the other chunks were read exactly once per pass
+        self.assertEqual(_FakeReadTrackTask.verify_reads, 3 + 1)
+        self.assertTrue(os.path.exists(self.out))
