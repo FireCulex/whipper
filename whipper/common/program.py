@@ -562,7 +562,8 @@ class Program:
         return ret
 
     def ripTrack(self, runner, trackResult, offset, device, taglist,
-                 overread, what=None, coverArtPath=None, verifyChunkSize=0):
+                 overread, what=None, coverArtPath=None, verifyChunkSize=0,
+                 maxChunkAttempts=5):
         """
         Rip and store a track of the disc.
 
@@ -589,6 +590,9 @@ class Program:
         :param verifyChunkSize: maximum frames verified per chunk;
                                 0 verifies the whole track at once
         :type verifyChunkSize: int
+        :param maxChunkAttempts: how many times a single chunk is re-read
+                                 when its test and verify checksums disagree
+        :type maxChunkAttempts: int
         """
         if trackResult.number == 0:
             start, stop = self.getHTOA()
@@ -610,7 +614,8 @@ class Program:
                                            taglist=taglist,
                                            what=what,
                                            coverArtPath=coverArtPath,
-                                           verifyChunkSize=verifyChunkSize)
+                                           verifyChunkSize=verifyChunkSize,
+                                           maxChunkAttempts=maxChunkAttempts)
 
         runner.run(t)
 

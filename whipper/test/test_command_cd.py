@@ -86,17 +86,20 @@ class SkipExistingTestCase(common.TestCase):
         self.assertFalse(rip.program.ripTrack.called)
         self.assertTrue(os.path.exists(self.track_path))
 
-    def testVerifyChunkSizeIsPassedToRipTrack(self):
+    def testRipOptionsArePassedToRipTrack(self):
         # no existing file, so the track gets ripped
         os.unlink(self.track_path)
         rip = _make_rip(self.dir, skip_existing=False)
         rip.options.verify_chunk_size = 150
+        rip.options.max_retries = 7
 
         rip.doCommand()
 
         self.assertTrue(rip.program.ripTrack.called)
         _, kwargs = rip.program.ripTrack.call_args
         self.assertEqual(kwargs['verifyChunkSize'], 150)
+        # -r/--max-retries also bounds the per-chunk verify retries
+        self.assertEqual(kwargs['maxChunkAttempts'], 7)
 
     def testFinishedRipDirRejectedByDefault(self):
         # a .log next to the disc file marks the rip as finished

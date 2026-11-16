@@ -319,8 +319,10 @@ Log files will log the path to tracks relative to this directory.
         self.parser.add_argument('-r', '--max-retries',
                                  action="store", dest="max_retries",
                                  help="number of rip attempts before giving "
-                                 "up if can't rip a track. This defaults to "
-                                 "{}; 0 means "
+                                 "up if can't rip a track; with chunked "
+                                 "verification this is also how many times a "
+                                 "single failing chunk is re-read. This "
+                                 "defaults to {}; 0 means "
                                  "infinity.".format(DEFAULT_MAX_RETRIES),
                                  default=DEFAULT_MAX_RETRIES)
         self.parser.add_argument('-k', '--keep-going',
@@ -521,7 +523,9 @@ Log files will log the path to tracks relative to this directory.
                                               coverArtPath=self.coverArtPath,
                                               verifyChunkSize=(
                                                   self.options
-                                                  .verify_chunk_size))
+                                                  .verify_chunk_size),
+                                              maxChunkAttempts=(
+                                                  self.options.max_retries))
                         break
                     # FIXME: catching too general exception (Exception)
                     except Exception as e:
