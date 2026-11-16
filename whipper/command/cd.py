@@ -326,6 +326,12 @@ Log files will log the path to tracks relative to this directory.
                                  help="continue ripping further tracks "
                                  "instead of giving up if a track "
                                  "can't be ripped")
+        self.parser.add_argument('--skip-existing',
+                                 action='store_true', dest='skip_existing',
+                                 default=False,
+                                 help="do not verify or re-rip tracks "
+                                 "whose files already exist in the "
+                                 "output directory")
 
     def handle_arguments(self):
         self.options.output_directory = os.path.expanduser(
@@ -436,18 +442,24 @@ Log files will log the path to tracks relative to this directory.
 
             # FIXME: optionally allow overriding reripping
             if os.path.exists(path):
-                if path != trackResult.filename:
-                    # the path is different (different name/template ?)
-                    # but we can copy it
-                    logger.debug('previous result %r, expected %r',
-                                 trackResult.filename, path)
+                if self.options.skip_existing:
+                    logger.info('track %d of %d already exists: %s '
+                                '(skipping due to --skip-existing)',
+                                number, len(self.itable.tracks),
+                                os.path.basename(path))
+                else:
+                    if path != trackResult.filename:
+                        # the path is different (different name/template ?)
+                        # but we can copy it
+                        logger.debug('previous result %r, expected %r',
+                                     trackResult.filename, path)
 
-                logger.info('verifying track %d of %d: %s',
-                            number, len(self.itable.tracks),
-                            os.path.basename(path))
-                if not self.program.verifyTrack(self.runner, trackResult):
-                    logger.warning('verification failed, reripping...')
-                    os.unlink(path)
+                    logger.info('verifying track %d of %d: %s',
+                                number, len(self.itable.tracks),
+                                os.path.basename(path))
+                    if not self.program.verifyTrack(self.runner, trackResult):
+                        logger.warning('verification failed, reripping...')
+                        os.unlink(path)
 
             if not os.path.exists(path):
                 logger.debug('path %r does not exist, ripping...', path)
