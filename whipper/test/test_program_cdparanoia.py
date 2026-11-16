@@ -1,8 +1,16 @@
 # -*- Mode: Python; test-case-name: whipper.test.test_program_cdparanoia -*-
 # vi:si:et:sw=4:sts=4:ts=4
 
+import binascii
 import os
+import shutil
+import struct
+import tempfile
+import wave
+from types import SimpleNamespace
+from unittest import mock
 
+from whipper.common import checksum
 from whipper.extern.task import task
 
 from whipper.program import cdparanoia
@@ -89,3 +97,229 @@ class CacheTestCase(common.TestCase):
         t = AnalyzeFileTask(path)
         self.runner.run(t)
         self.assertTrue(t.defeatsCache)
+
+
+class ChunkRangesTestCase(common.TestCase):
+
+    def testDisabledGivesSingleChunk(self):
+        self.assertEqual(cdparanoia.chunkRanges(0, 99, 0), [(0, 99)])
+        self.assertEqual(cdparanoia.chunkRanges(0, 99, -5), [(0, 99)])
+
+    def testChunkBiggerThanTrackGivesSingleChunk(self):
+        self.assertEqual(cdparanoia.chunkRanges(0, 99, 100), [(0, 99)])
+
+    def testChunks(self):
+        self.assertEqual(cdparanoia.chunkRanges(0, 99, 30),
+                         [(0, 29), (30, 59), (60, 89), (90, 99)])
+
+    def testChunksWithStartOffset(self):
+        self.assertEqual(cdparanoia.chunkRanges(100, 250, 75),
+                         [(100, 174), (175, 249), (250, 250)])
+
+
+def _write_wav(path, data):
+    w = wave.open(path, 'wb')
+    w.setparams((2, 2, 44100, 0, 'NONE', 'NONE'))
+    w.writeframes(data)
+    w.close()
+
+
+class VerifyChunkTaskTestCase(common.TestCase):
+
+    def setUp(self):
+        self.runner = task.SyncRunner(verbose=False)
+        self.dir = tempfile.mkdtemp(suffix='.whipper.test.chunk')
+        self.data = b''.join(
+            struct.pack('<hh', i % 32768, -i % 32768) for i in range(100))
+        self.testPath = os.path.join(self.dir, 'test.wav')
+        self.verifyPath = os.path.join(self.dir, 'verify.wav')
+        self.outPath = os.path.join(self.dir, 'out.wav')
+        _write_wav(self.testPath, self.data)
+        _write_wav(self.verifyPath, self.data)
+        open(self.outPath, 'wb').close()
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _crc(self, value):
+        return SimpleNamespace(checksum=value)
+
+    def testMatchingChecksumsAppendChunk(self):
+        t = cdparanoia.VerifyChunkTask(
+            self._crc(0xdeadbeef), self._crc(0xdeadbeef),
+            self.testPath, self.verifyPath, self.outPath,
+            start=10, stop=19, first=True, totalDataBytes=len(self.data))
+        self.runner.run(t)
+
+        with open(self.outPath, 'rb') as f:
+            out = f.read()
+        # output is the wav header (44 bytes) plus the audio data
+        self.assertEqual(len(out), 44 + len(self.data))
+        self.assertEqual(out[44:], self.data)
+        # the header size fields cover the whole track, not just the chunk
+        self.assertEqual(struct.unpack('<I', out[40:44])[0], len(self.data))
+        self.assertEqual(struct.unpack('<I', out[4:8])[0], 36 + len(self.data))
+        # chunk temp files are cleaned up
+        self.assertFalse(os.path.exists(self.testPath))
+        self.assertFalse(os.path.exists(self.verifyPath))
+
+    def testMismatchRaisesWithFrameRange(self):
+        t = cdparanoia.VerifyChunkTask(
+            self._crc(0x11111111), self._crc(0x22222222),
+            self.testPath, self.verifyPath, self.outPath,
+            start=10, stop=19, first=True, totalDataBytes=len(self.data))
+        try:
+            self.runner.run(t)
+            self.fail('expected TaskException')
+        except task.TaskException as e:
+            self.assertIsInstance(e.exception, cdparanoia.ChecksumException)
+            self.assertIn('frames 10-19', str(e.exception))
+        # nothing was appended to the output
+        self.assertEqual(os.path.getsize(self.outPath), 0)
+
+
+class ReadVerifyTrackTaskStructureTestCase(common.TestCase):
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(suffix='.whipper.test.rvt')
+        self.out = os.path.join(self.dir, 'track.flac')
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _make(self, start, stop, verifyChunkSize):
+        return cdparanoia.ReadVerifyTrackTask(
+            self.out, None, start, stop, False, verifyChunkSize=verifyChunkSize)
+
+    def testWholeTrackByDefault(self):
+        t = self._make(100, 199, 0)
+        # one chunk: read, crc, verify read, crc, append, encode, crc, peak,
+        # tag, embed
+        self.assertEqual(len(t.tasks), 10)
+        self.assertIsInstance(t.tasks[0], cdparanoia.ReadTrackTask)
+        self.assertEqual((t.tasks[0]._start, t.tasks[0]._stop), (100, 199))
+        self.assertIsInstance(t.tasks[4], cdparanoia.VerifyChunkTask)
+        self.assertTrue(t.tasks[4]._first)
+
+    def testChunkedTasks(self):
+        t = self._make(0, 24, 10)
+        # 3 chunks of 5 tasks each, plus encode, crc, peak, tag, embed
+        self.assertEqual(len(t.tasks), 3 * 5 + 5)
+        for i in range(3):
+            base = i * 5
+            self.assertIsInstance(t.tasks[base], cdparanoia.ReadTrackTask)
+            self.assertIsInstance(t.tasks[base + 1], checksum.CRC32Task)
+            self.assertIsInstance(t.tasks[base + 2], cdparanoia.ReadTrackTask)
+            self.assertIsInstance(t.tasks[base + 3], checksum.CRC32Task)
+            self.assertIsInstance(t.tasks[base + 4], cdparanoia.VerifyChunkTask)
+            self.assertEqual(t.tasks[base]._start, i * 10)
+            self.assertEqual(t.tasks[base]._stop, min(i * 10 + 9, 24))
+            self.assertEqual(t.tasks[base + 4]._first, i == 0)
+        # both passes of a chunk chain into the same running checksums
+        self.assertIs(t.tasks[1].chain, t.tasks[6].chain)
+        self.assertIs(t.tasks[3].chain, t.tasks[8].chain)
+
+
+class _NoopTask(task.Task):
+    peak = 0
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def start(self, runner):
+        task.Task.start(self, runner)
+        self.schedule(0.0, self.stop)
+
+
+def _chunk_data(start, stop, corrupt=False):
+    data = b''.join(
+        struct.pack('<hh', f % 32768, (-f) % 32768)
+        for f in range(start, stop + 1))
+    if corrupt:
+        data = data[:-1] + bytes([data[-1] ^ 0xff])
+    return data
+
+
+class _FakeReadTrackTask(cdparanoia.ReadTrackTask):
+    """ReadTrackTask that writes deterministic WAV data instead of
+    invoking cd-paranoia; the verify pass can be corrupted on demand."""
+
+    corrupt_verify = False
+
+    def __init__(self, *args, **kwargs):
+        self._action = kwargs.get('action', 'Reading')
+        super().__init__(*args, **kwargs)
+
+    def start(self, runner):
+        task.Task.start(self, runner)
+        self.schedule(0.0, self._fake_read)
+
+    def _fake_read(self):
+        corrupt = self.corrupt_verify and self._action == 'Verifying'
+        _write_wav(self.path, _chunk_data(self._start, self._stop,
+                                          corrupt=corrupt))
+        frames = self._stop - self._start + 1
+        self._parser.reads = 2 * frames
+        self.duration = frames / 75.0
+        self.stop()
+
+
+class ReadVerifyTrackTaskRunTestCase(common.TestCase):
+    """Run the whole chunked read/verify flow with a fake drive."""
+
+    def setUp(self):
+        self.runner = task.SyncRunner(verbose=False)
+        self.dir = tempfile.mkdtemp(suffix='.whipper.test.rvt.run')
+        self.out = os.path.join(self.dir, 'track.flac')
+        from whipper.common import encode
+        self._patches = [
+            mock.patch.object(cdparanoia, 'ReadTrackTask', _FakeReadTrackTask),
+            mock.patch.object(encode, 'FlacEncodeTask', _NoopTask),
+            mock.patch.object(encode, 'SoxPeakTask', _NoopTask),
+            mock.patch.object(encode, 'TaggingTask', _NoopTask),
+            mock.patch.object(encode, 'EmbedPictureTask', _NoopTask),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+        _FakeReadTrackTask.corrupt_verify = False
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def _make(self, start, stop, verifyChunkSize):
+        return cdparanoia.ReadVerifyTrackTask(
+            self.out, None, start, stop, False, verifyChunkSize=verifyChunkSize)
+
+    def testChunkedRunAssemblesWholeTrack(self):
+        t = self._make(0, 24, 10)
+        self.runner.run(t)
+
+        expected = binascii.crc32(_chunk_data(0, 24)) & 0xffffffff
+        self.assertEqual(t.testchecksum, expected)
+        self.assertEqual(t.copychecksum, expected)
+        self.assertEqual(t.checksum, expected)
+        self.assertEqual(t.quality, 1.0)
+        # the output file was moved into place, temps cleaned up
+        self.assertTrue(os.path.exists(self.out))
+        self.assertFalse(os.path.exists(self.out + '.part'))
+        self.assertFalse(os.path.exists(t._tmpwavpath))
+        for testpath, verifypath in t._chunkPaths:
+            self.assertFalse(os.path.exists(testpath))
+            self.assertFalse(os.path.exists(verifypath))
+
+    def testChunkedRunDetectsCorruptVerifyPassWithRange(self):
+        _FakeReadTrackTask.corrupt_verify = True
+        t = self._make(0, 24, 10)
+        try:
+            self.runner.run(t)
+            self.fail('expected TaskException')
+        except task.TaskException as e:
+            self.assertIsInstance(e.exception, cdparanoia.ChecksumException)
+            # first chunk is frames 0-9
+            self.assertIn('frames 0-9', str(e.exception))
+        self.assertFalse(os.path.exists(self.out))
+        for testpath, verifypath in t._chunkPaths:
+            self.assertFalse(os.path.exists(testpath))
+            self.assertFalse(os.path.exists(verifypath))

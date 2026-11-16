@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 
 SILENT = 0
 DEFAULT_MAX_RETRIES = 5
+# 5 seconds worth of CD frames (75 frames per second)
+DEFAULT_VERIFY_CHUNK_SIZE = 5 * 75
 
 DEFAULT_TRACK_TEMPLATE = '%r/%A - %d/%t. %a - %n'
 DEFAULT_DISC_TEMPLATE = '%r/%A - %d/%A - %d'
@@ -332,6 +334,18 @@ Log files will log the path to tracks relative to this directory.
                                  help="do not verify or re-rip tracks "
                                  "whose files already exist in the "
                                  "output directory")
+        self.parser.add_argument('--verify-chunk-size',
+                                 action='store', dest='verify_chunk_size',
+                                 type=int, metavar='FRAMES',
+                                 default=DEFAULT_VERIFY_CHUNK_SIZE,
+                                 help="verify each track in chunks of FRAMES "
+                                 "CD frames (75 frames = 1 second); each "
+                                 "chunk is read twice and its checksums "
+                                 "compared before moving on, so a mismatch "
+                                 "is reported with its frame range; "
+                                 "0 verifies the whole track at once "
+                                 "(default: %d, i.e. 5 seconds)"
+                                 % DEFAULT_VERIFY_CHUNK_SIZE)
 
     def handle_arguments(self):
         self.options.output_directory = os.path.expanduser(
@@ -370,6 +384,12 @@ Log files will log the path to tracks relative to this directory.
             self.options.max_retries = float("inf")
         elif self.options.max_retries < 0:
             raise ValueError("number of max retries must be positive")
+
+        if self.options.verify_chunk_size < 0:
+            raise SystemExit(
+                "Error: --verify-chunk-size must be >= 0 "
+                "(0 verifies the whole track at once)"
+            )
 
     def doCommand(self):
         self.program.setWorkingDirectory(self.options.working_directory)
@@ -493,7 +513,10 @@ Log files will log the path to tracks relative to this directory.
                                                   number,
                                                   len(self.itable.tracks),
                                                   extra),
-                                              coverArtPath=self.coverArtPath)
+                                              coverArtPath=self.coverArtPath,
+                                              verifyChunkSize=(
+                                                  self.options
+                                                  .verify_chunk_size))
                         break
                     # FIXME: catching too general exception (Exception)
                     except Exception as e:

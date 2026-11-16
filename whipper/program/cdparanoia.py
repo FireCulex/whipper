@@ -23,6 +23,7 @@ import os
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import tempfile
 import time
@@ -405,6 +406,105 @@ class ReadTrackTask(task.Task):
         return
 
 
+def chunkRanges(start, stop, chunkSize):
+    """
+    Split the inclusive frame range [start, stop] into chunks.
+
+    :param start: first frame (inclusive)
+    :param stop: last frame (inclusive)
+    :param chunkSize: maximum number of frames per chunk;
+                      <= 0 means a single chunk covering the whole range
+    :returns: list of (chunkStart, chunkStop) inclusive tuples
+    :rtype: list(tuple(int, int))
+    """
+    if chunkSize <= 0 or stop - start + 1 <= chunkSize:
+        return [(start, stop)]
+    return [(cs, min(cs + chunkSize - 1, stop))
+            for cs in range(start, stop + 1, chunkSize)]
+
+
+class VerifyChunkTask(task.Task):
+    """
+    Compare the test and verify checksums of one chunk of frames.
+
+    If they match, the chunk's audio data is appended to the output WAV
+    (including the WAV header for the first chunk, with its size fields
+    fixed up to cover the whole track) and the chunk's temporary files
+    are removed. If they don't match, a ChecksumException naming the
+    frame range is raised.
+    """
+
+    logCategory = 'VerifyChunkTask'
+    description = 'Verifying chunk'
+
+    # cdparanoia writes a standard 44 byte WAV header; ReadTrackTask
+    # verifies the file size is exactly header + frames * BYTES_PER_FRAME
+    _WAV_HEADER_SIZE = 44
+    _BLOCK_SIZE = 1024 * 1024
+
+    def __init__(self, testCrc, verifyCrc, testPath, verifyPath, outPath,
+                 start, stop, first, totalDataBytes=None):
+        """
+        Init VerifyChunkTask.
+
+        :param testCrc: CRC32Task that checksummed the test read of the chunk
+        :param verifyCrc: CRC32Task that checksummed the verify read
+        :param testPath: path of the WAV holding the test read
+        :param verifyPath: path of the WAV holding the verify read
+        :param outPath: path of the output WAV to append the chunk to
+        :param start: first frame of the chunk (inclusive)
+        :param stop: last frame of the chunk (inclusive)
+        :param first: whether this is the first chunk of the track
+        :param totalDataBytes: audio bytes of the whole track, used to fix
+                               up the WAV header of the first chunk
+        """
+        self._testCrc = testCrc
+        self._verifyCrc = verifyCrc
+        self._testPath = testPath
+        self._verifyPath = verifyPath
+        self._outPath = outPath
+        self._start = start
+        self._stop = stop
+        self._first = first
+        self._totalDataBytes = totalDataBytes
+        self.description = 'Verifying frames %d-%d' % (start, stop)
+
+    def start(self, runner):
+        task.Task.start(self, runner)
+        self.schedule(0.0, self._verify)
+
+    def _verify(self):
+        if self._testCrc.checksum != self._verifyCrc.checksum:
+            self.setAndRaiseException(ChecksumException(
+                'read and verify failed for frames %d-%d: test checksum '
+                '%08x, verify checksum %08x' % (
+                    self._start, self._stop,
+                    self._testCrc.checksum, self._verifyCrc.checksum)))
+            self.stop()
+            return
+
+        with open(self._testPath, 'rb') as src, \
+                open(self._outPath, 'ab') as dst:
+            header = bytearray(src.read(self._WAV_HEADER_SIZE))
+            if self._first:
+                if self._totalDataBytes is not None:
+                    # the chunk header only covers the chunk; fix up the
+                    # RIFF and data size fields to cover the whole track
+                    struct.pack_into('<I', header, 4,
+                                     36 + self._totalDataBytes)
+                    struct.pack_into('<I', header, 40, self._totalDataBytes)
+                dst.write(bytes(header))
+            while True:
+                block = src.read(self._BLOCK_SIZE)
+                if not block:
+                    break
+                dst.write(block)
+
+        os.unlink(self._testPath)
+        os.unlink(self._verifyPath)
+        self.stop()
+
+
 class ReadVerifyTrackTask(task.MultiSeparateTask):
     """
     Task that reads and verifies a track using cdparanoia.
@@ -440,7 +540,8 @@ class ReadVerifyTrackTask(task.MultiSeparateTask):
     _tmppath = None
 
     def __init__(self, path, table, start, stop, overread, offset=0,
-                 device=None, taglist=None, what="track", coverArtPath=None):
+                 device=None, taglist=None, what="track", coverArtPath=None,
+                 verifyChunkSize=0):
         """
         Init ReadVerifyTrackTask.
 
@@ -458,6 +559,12 @@ class ReadVerifyTrackTask(task.MultiSeparateTask):
         :type device: str
         :param taglist: a dict of tags
         :type taglist: dict
+        :param verifyChunkSize: maximum frames per verified chunk; each
+                                chunk is read twice and its checksums
+                                compared before the next chunk is read,
+                                so a mismatch is reported with its frame
+                                range; 0 verifies the whole track at once
+        :type verifyChunkSize: int
         """
         task.MultiSeparateTask.__init__(self)
 
@@ -470,19 +577,47 @@ class ReadVerifyTrackTask(task.MultiSeparateTask):
         os.fchmod(fd, 0o644)
         os.close(fd)
         self._tmpwavpath = tmppath
+        self._start = start
+        self._stop = stop
 
         from whipper.common import checksum
 
         self.tasks = []
-        self.tasks.append(
-            ReadTrackTask(tmppath, table, start, stop, overread,
-                          offset=offset, device=device, what=what))
-        self.tasks.append(checksum.CRC32Task(tmppath))
-        t = ReadTrackTask(tmppath, table, start, stop, overread,
-                          offset=offset, device=device, action="Verifying",
-                          what=what)
-        self.tasks.append(t)
-        self.tasks.append(checksum.CRC32Task(tmppath))
+        self._chunkPaths = []
+        self._readTasks = []
+        self._verifyTasks = []
+        # the per-chunk CRCs of each pass are chained, so they combine into
+        # the same value a whole-track CRC would give
+        self._runningTest = checksum.RunningChecksum()
+        self._runningVerify = checksum.RunningChecksum()
+
+        chunks = chunkRanges(start, stop, verifyChunkSize)
+        for i, (cs, ce) in enumerate(chunks):
+            testpath = self._mktmp('.whipper.test.wav')
+            verifypath = self._mktmp('.whipper.verify.wav')
+            self._chunkPaths.append((testpath, verifypath))
+            if len(chunks) > 1:
+                chunkWhat = '%s (frames %d-%d)' % (what, cs, ce)
+            else:
+                chunkWhat = what
+            t_read = ReadTrackTask(testpath, table, cs, ce, overread,
+                                   offset=offset, device=device,
+                                   what=chunkWhat)
+            t_crcTest = checksum.CRC32Task(testpath, chain=self._runningTest)
+            t_verify = ReadTrackTask(verifypath, table, cs, ce, overread,
+                                     offset=offset, device=device,
+                                     action="Verifying", what=chunkWhat)
+            t_crcVerify = checksum.CRC32Task(verifypath,
+                                             chain=self._runningVerify)
+            t_append = VerifyChunkTask(t_crcTest, t_crcVerify, testpath,
+                                       verifypath, tmppath, cs, ce,
+                                       first=(i == 0),
+                                       totalDataBytes=(
+                                           (stop - start + 1) *
+                                           common.BYTES_PER_FRAME))
+            self._readTasks.append(t_read)
+            self._verifyTasks.append(t_verify)
+            self.tasks += [t_read, t_crcTest, t_verify, t_crcVerify, t_append]
 
         # encode to the final path + '.part'
         try:
@@ -505,8 +640,10 @@ class ReadVerifyTrackTask(task.MultiSeparateTask):
         # in general stupid to run the CRC32 on the flac file since it already
         # has --verify. We should just get rid of this CRC32 step.
         # make sure our encoding is accurate
-        self.tasks.append(checksum.CRC32Task(tmppath))
-        self.tasks.append(encode.SoxPeakTask(tmppath))
+        self._encodeCrcTask = checksum.CRC32Task(tmppath)
+        self.tasks.append(self._encodeCrcTask)
+        self._peakTask = encode.SoxPeakTask(tmppath)
+        self.tasks.append(self._peakTask)
 
         # TODO: Move tagging and embed picture outside of cdparanoia
         self.tasks.append(encode.TaggingTask(tmpoutpath, taglist))
@@ -514,22 +651,38 @@ class ReadVerifyTrackTask(task.MultiSeparateTask):
 
         self.checksum = None
 
+    @staticmethod
+    def _mktmp(suffix):
+        fd, path = tempfile.mkstemp(suffix=suffix)
+        os.fchmod(fd, 0o644)
+        os.close(fd)
+        return path
+
     def stop(self):
         # FIXME: maybe this kind of try-wrapping to make sure
         # we chain up should be handled by a parent class function ?
         try:
-            if not self.exception:
-                self.quality = max(self.tasks[0].quality,
-                                   self.tasks[2].quality)
-                self.peak = self.tasks[6].peak
-                logger.debug('peak: %r', self.peak)
-                self.testspeed = self.tasks[0].speed
-                self.copyspeed = self.tasks[2].speed
-                self.testduration = self.tasks[0].duration
-                self.copyduration = self.tasks[2].duration
+            # clean up chunk temp files, whether consumed or not
+            for testpath, verifypath in self._chunkPaths:
+                for p in (testpath, verifypath):
+                    if p and os.path.exists(p):
+                        os.unlink(p)
 
-                self.testchecksum = c1 = self.tasks[1].checksum
-                self.copychecksum = c2 = self.tasks[3].checksum
+            if not self.exception:
+                totalFrames = self._stop - self._start + 1
+                testReads = sum(t._parser.reads for t in self._readTasks)
+                verifyReads = sum(t._parser.reads for t in self._verifyTasks)
+                self.quality = max(min(totalFrames * 2.0 / testReads, 1.0),
+                                   min(totalFrames * 2.0 / verifyReads, 1.0))
+                self.peak = self._peakTask.peak
+                logger.debug('peak: %r', self.peak)
+                self.testduration = sum(t.duration for t in self._readTasks)
+                self.copyduration = sum(t.duration for t in self._verifyTasks)
+                self.testspeed = (totalFrames / 75.0) / self.testduration
+                self.copyspeed = (totalFrames / 75.0) / self.copyduration
+
+                self.testchecksum = c1 = self._runningTest.value & 0xffffffff
+                self.copychecksum = c2 = self._runningVerify.value & 0xffffffff
                 if c1 == c2:
                     logger.info('checksums match, %08x', c1)
                     self.checksum = self.testchecksum
@@ -540,7 +693,7 @@ class ReadVerifyTrackTask(task.MultiSeparateTask):
                     self.exception = ChecksumException(
                         'read and verify failed: test checksum')
 
-                if self.tasks[5].checksum != self.checksum:
+                if self._encodeCrcTask.checksum != self.checksum:
                     self.exception = ChecksumException(
                         'Encoding failed, checksum does not match')
 
@@ -560,6 +713,9 @@ class ReadVerifyTrackTask(task.MultiSeparateTask):
                     os.unlink(self._tmppath)
             else:
                 logger.debug('stop: exception %r', self.exception)
+                for p in (self._tmpwavpath, self._tmppath):
+                    if p and os.path.exists(p):
+                        os.unlink(p)
         # FIXME: catching too general exception (Exception)
         except Exception as e:
             print('WARNING: unhandled exception %r' % (e, ))
